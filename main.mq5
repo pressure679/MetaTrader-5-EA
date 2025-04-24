@@ -1,24 +1,29 @@
 //+------------------------------------------------------------------+
-//|                                               EMA Crossover EA   |
-//|                             Auto-closes opposite trades on signal |
+//|                                             EMA_Crossover_EA.mq5|
+//|                             Adapted by ChatGPT                  |
 //+------------------------------------------------------------------+
+#property copyright "ChatGPT"
+#property version   "1.00"
 #property strict
 
-input int    fastEMAPeriod = 7;
-input int    slowEMAPeriod = 14;
-input double lotSize       = 0.01;
-input string symbol        = "XAUUSD"; // or _Symbol for current chart
-input ENUM_TIMEFRAMES timeframe = PERIOD_M1;
+input int    fastEMALen     = 7;
+input int    slowEMALen     = 14;
+input double riskPercent    = 10.0;    // Risk % of balance per trade
+input int    slippage       = 5;
+input ulong  magicNumber    = 123456;
 
-int ticket;
+double emaFastPrev, emaSlowPrev;
+string symbol;
+ENUM_TIMEFRAMES tf;
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
   {
-   Print("EMA Crossover EA Initialized");
-   return(INIT_SUCCEEDED);
+   symbol = _Symbol;
+   tf = PERIOD_CURRENT;
+   return INIT_SUCCEEDED;
   }
 
 //+------------------------------------------------------------------+
@@ -26,98 +31,93 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnTick()
   {
-   double fastEMA = iMA(symbol, timeframe, fastEMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 0);
-   double slowEMA = iMA(symbol, timeframe, slowEMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double emaFast = iMA(symbol, tf, fastEMALen, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double emaSlow = iMA(symbol, tf, slowEMALen, 0, MODE_EMA, PRICE_CLOSE, 0);
 
-   // Get current position info
-   int total = PositionsTotal();
-   bool hasBuy = false;
-   bool hasSell = false;
+   bool buySignal  = (emaFast > emaSlow) && (emaFastPrev <= emaSlowPrev);
+   bool sellSignal = (emaFast < emaSlow) && (emaFastPrev >= emaSlowPrev);
 
-   for (int i = 0; i < total; i++)
+   if (buySignal)
      {
-      if (PositionGetSymbol(i) == symbol)
-        {
-         if (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
-            hasBuy = true;
-         if (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
-            hasSell = true;
-        }
+      CloseOpenOrders(); // Close opposite
+      OpenOrder(ORDER_TYPE_BUY);
+     }
+   else if (sellSignal)
+     {
+      CloseOpenOrders(); // Close opposite
+      OpenOrder(ORDER_TYPE_SELL);
      }
 
-   // === Check and manage trade ===
-   if (fastEMA > slowEMA)
-     {
-      if (hasSell)
-         ClosePosition(POSITION_TYPE_SELL);
-      if (!hasBuy)
-         OpenOrder(ORDER_TYPE_BUY);
-     }
-   else if (fastEMA < slowEMA)
-     {
-      if (hasBuy)
-         ClosePosition(POSITION_TYPE_BUY);
-      if (!hasSell)
-         OpenOrder(ORDER_TYPE_SELL);
-     }
+   emaFastPrev = emaFast;
+   emaSlowPrev = emaSlow;
   }
 
 //+------------------------------------------------------------------+
-//| Open Buy/Sell Order                                              |
+//| Open Market Order                                                |
 //+------------------------------------------------------------------+
 void OpenOrder(ENUM_ORDER_TYPE orderType)
   {
    MqlTradeRequest request;
-   MqlTradeResult result;
+   MqlTradeResult  result;
+
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double lotStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+   double minLot  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+
+   // Dynamic Lot Size Calculation
+   double calcLot = (balance * riskPercent / 100.0) / 100.0;
+   double lotSize = MathMax(minLot, MathMin(maxLot, NormalizeDouble(calcLot, 2)));
 
    ZeroMemory(request);
-   request.action = TRADE_ACTION_DEAL;
-   request.symbol = symbol;
-   request.volume = lotSize;
-   request.type = orderType;
-   request.price = (orderType == ORDER_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_ASK) : SymbolInfoDouble(symbol, SYMBOL_BID);
-   request.deviation = 5;
-   request.magic = 123456;
+   request.action   = TRADE_ACTION_DEAL;
+   request.symbol   = symbol;
+   request.volume   = lotSize;
+   request.type     = orderType;
+   request.price    = (orderType == ORDER_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_ASK)
+                                                    : SymbolInfoDouble(symbol, SYMBOL_BID);
+   request.slippage = slippage;
+   request.magic    = magicNumber;
 
    OrderSend(request, result);
 
    if (result.retcode != TRADE_RETCODE_DONE)
       Print("Order send failed: ", result.comment);
    else
-      Print("Opened ", (orderType == ORDER_TYPE_BUY ? "BUY" : "SELL"), " at ", request.price);
+      Print("Opened ", (orderType == ORDER_TYPE_BUY ? "BUY" : "SELL"), 
+            " at ", request.price, " with lot: ", lotSize);
   }
 
 //+------------------------------------------------------------------+
-//| Close open position by type                                      |
+//| Close Existing Orders                                            |
 //+------------------------------------------------------------------+
-void ClosePosition(int positionType)
+void CloseOpenOrders()
   {
-   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   for (int i = OrdersTotal() - 1; i >= 0; i--)
      {
-      if (PositionGetSymbol(i) == symbol && PositionGetInteger(POSITION_TYPE) == positionType)
-        {
-         ulong ticket = PositionGetInteger(POSITION_TICKET);
-         double volume = PositionGetDouble(POSITION_VOLUME);
+      if (!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
 
-         MqlTradeRequest request;
-         MqlTradeResult result;
-         ZeroMemory(request);
+      if (OrderGetInteger(ORDER_MAGIC) != magicNumber ||
+          OrderGetString(ORDER_SYMBOL) != symbol) continue;
 
-         request.action = TRADE_ACTION_DEAL;
-         request.position = ticket;
-         request.symbol = symbol;
-         request.volume = volume;
-         request.magic = 123456;
-         request.deviation = 5;
-         request.type = (positionType == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-         request.price = (positionType == POSITION_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_BID) : SymbolInfoDouble(symbol, SYMBOL_ASK);
+      ENUM_ORDER_TYPE orderType = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
+      double volume = OrderGetDouble(ORDER_VOLUME_CURRENT);
+      ulong ticket  = OrderGetTicket();
 
-         OrderSend(request, result);
+      MqlTradeRequest request;
+      MqlTradeResult  result;
+      ZeroMemory(request);
 
-         if (result.retcode != TRADE_RETCODE_DONE)
-            Print("Close failed: ", result.comment);
-         else
-            Print("Closed ", (positionType == POSITION_TYPE_BUY ? "BUY" : "SELL"), " position");
-        }
+      request.action = TRADE_ACTION_DEAL;
+      request.position = ticket;
+      request.symbol = symbol;
+      request.volume = volume;
+      request.type = (orderType == ORDER_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+      request.price = (request.type == ORDER_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_ASK)
+                                                       : SymbolInfoDouble(symbol, SYMBOL_BID);
+      request.magic = magicNumber;
+      request.slippage = slippage;
+
+      OrderSend(request, result);
      }
   }
