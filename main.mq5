@@ -1,93 +1,123 @@
 //+------------------------------------------------------------------+
-//|                        EMA Scalping Bot for MT5                 |
-//|                      Combines EMA Crossover + SL/TP             |
+//|                                               EMA Crossover EA   |
+//|                             Auto-closes opposite trades on signal |
 //+------------------------------------------------------------------+
-input int      FastEMAPeriod     = 7;
-input int      SlowEMAPeriod     = 14;
-input double   TakeProfitPercent = 2.0;   // TP in %
-input double   StopLossPercent   = 1.0;   // SL in %
-input double   TrailingStopPercent = 0.5; // Trailing Stop in %
-input double   LotSize           = 0.01;
+#property strict
 
-int fastEMABuffer, slowEMABuffer;
-double prevFastEMA, prevSlowEMA;
-bool  inTrade = false;
+input int    fastEMAPeriod = 7;
+input int    slowEMAPeriod = 14;
+input double lotSize       = 0.01;
+input string symbol        = "XAUUSD"; // or _Symbol for current chart
+input ENUM_TIMEFRAMES timeframe = PERIOD_M1;
+
+int ticket;
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
-{
-   Print("EMA Scalping Bot Initialized");
+  {
+   Print("EMA Crossover EA Initialized");
    return(INIT_SUCCEEDED);
-}
-
-//+------------------------------------------------------------------+
-//| Expert deinitialization function                                 |
-//+------------------------------------------------------------------+
-void OnDeinit(const int reason)
-{
-}
+  }
 
 //+------------------------------------------------------------------+
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
 void OnTick()
-{
-   double fastEMA = iMA(NULL, 0, FastEMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 0);
-   double slowEMA = iMA(NULL, 0, SlowEMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 0);
-   prevFastEMA = iMA(NULL, 0, FastEMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 1);
-   prevSlowEMA = iMA(NULL, 0, SlowEMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 1);
+  {
+   double fastEMA = iMA(symbol, timeframe, fastEMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double slowEMA = iMA(symbol, timeframe, slowEMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 0);
 
-   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   // Get current position info
+   int total = PositionsTotal();
+   bool hasBuy = false;
+   bool hasSell = false;
 
-   // Buy Signal: Fast EMA crosses above Slow EMA
-   if (prevFastEMA < prevSlowEMA && fastEMA > slowEMA && !PositionSelect(_Symbol))
-   {
-      OpenTrade(ORDER_TYPE_BUY, price);
-   }
+   for (int i = 0; i < total; i++)
+     {
+      if (PositionGetSymbol(i) == symbol)
+        {
+         if (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+            hasBuy = true;
+         if (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+            hasSell = true;
+        }
+     }
 
-   // Sell Signal: Fast EMA crosses below Slow EMA
-   if (prevFastEMA > prevSlowEMA && fastEMA < slowEMA && !PositionSelect(_Symbol))
-   {
-      OpenTrade(ORDER_TYPE_SELL, price);
-   }
-}
+   // === Check and manage trade ===
+   if (fastEMA > slowEMA)
+     {
+      if (hasSell)
+         ClosePosition(POSITION_TYPE_SELL);
+      if (!hasBuy)
+         OpenOrder(ORDER_TYPE_BUY);
+     }
+   else if (fastEMA < slowEMA)
+     {
+      if (hasBuy)
+         ClosePosition(POSITION_TYPE_BUY);
+      if (!hasSell)
+         OpenOrder(ORDER_TYPE_SELL);
+     }
+  }
 
 //+------------------------------------------------------------------+
-//| Open Trade with SL/TP/Trailing                                  |
+//| Open Buy/Sell Order                                              |
 //+------------------------------------------------------------------+
-void OpenTrade(int direction, double price)
-{
-   double tpLevel = 0;
-   double slLevel = 0;
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double pipMultiplier = SymbolInfoInteger(_Symbol, SYMBOL_DIGITS) == 3 || SymbolInfoInteger(_Symbol, SYMBOL_DIGITS) == 5 ? 10 : 1;
+void OpenOrder(ENUM_ORDER_TYPE orderType)
+  {
+   MqlTradeRequest request;
+   MqlTradeResult result;
 
-   double slPoints = (price * StopLossPercent / 100.0) / point;
-   double tpPoints = (price * TakeProfitPercent / 100.0) / point;
-   double tsPoints = (price * TrailingStopPercent / 100.0) / point;
+   ZeroMemory(request);
+   request.action = TRADE_ACTION_DEAL;
+   request.symbol = symbol;
+   request.volume = lotSize;
+   request.type = orderType;
+   request.price = (orderType == ORDER_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_ASK) : SymbolInfoDouble(symbol, SYMBOL_BID);
+   request.deviation = 5;
+   request.magic = 123456;
 
-   if (direction == ORDER_TYPE_BUY)
-   {
-      tpLevel = price + tpPoints * point;
-      slLevel = price - slPoints * point;
-   }
+   OrderSend(request, result);
+
+   if (result.retcode != TRADE_RETCODE_DONE)
+      Print("Order send failed: ", result.comment);
    else
-   {
-      tpLevel = price - tpPoints * point;
-      slLevel = price + slPoints * point;
-   }
-
-   trade.PositionOpen(_Symbol, direction, LotSize, price, slLevel, tpLevel);
-   if (TrailingStopPercent > 0)
-   {
-      trade.TrailingStop(_Symbol, tsPoints);
-   }
-}
+      Print("Opened ", (orderType == ORDER_TYPE_BUY ? "BUY" : "SELL"), " at ", request.price);
+  }
 
 //+------------------------------------------------------------------+
-//| Global CTrade instance                                           |
+//| Close open position by type                                      |
 //+------------------------------------------------------------------+
-#include <Trade\Trade.mqh>
-CTrade trade;
+void ClosePosition(int positionType)
+  {
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+     {
+      if (PositionGetSymbol(i) == symbol && PositionGetInteger(POSITION_TYPE) == positionType)
+        {
+         ulong ticket = PositionGetInteger(POSITION_TICKET);
+         double volume = PositionGetDouble(POSITION_VOLUME);
+
+         MqlTradeRequest request;
+         MqlTradeResult result;
+         ZeroMemory(request);
+
+         request.action = TRADE_ACTION_DEAL;
+         request.position = ticket;
+         request.symbol = symbol;
+         request.volume = volume;
+         request.magic = 123456;
+         request.deviation = 5;
+         request.type = (positionType == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+         request.price = (positionType == POSITION_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_BID) : SymbolInfoDouble(symbol, SYMBOL_ASK);
+
+         OrderSend(request, result);
+
+         if (result.retcode != TRADE_RETCODE_DONE)
+            Print("Close failed: ", result.comment);
+         else
+            Print("Closed ", (positionType == POSITION_TYPE_BUY ? "BUY" : "SELL"), " position");
+        }
+     }
+  }
